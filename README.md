@@ -1,49 +1,72 @@
-# Monitor de Bonos Soberanos
+# Renta Fija Soberana
 
-App de Streamlit con tres solapas:
+App de Streamlit que replica la planilla `Soberanos_por_asset_class.xlsx`, con precios en vivo.
 
-1. **Resumen**: cotización, valor técnico, paridad, pago final, TNA, TEM, TIR y duration de:
+## Solapas
+
+1. **Resumen** (hoja *Resumen*): los mismos parámetros que la planilla.
+   - **Shock de precio** aplicado a todos los bonos.
+   - **Proyección TAMAR**: Manual, Promedio 5 días o Último dato.
+   - **Inflación mensual proyectada** (tabla editable por mes de IPC).
+   - Tablas de bonos con precio base y precio usado, TIR (TEA), TNA, TEM, MD, liquidación y moneda.
+   - **Sensibilidad** de la TIR al shock de precio.
    - Bonos en pesos: S26F7, T31Y7, T30J7 (tasa fija), TZXY7, TZX27 (CER), TMF27, TML27 (TAMAR) y TZV27 (dólar linked).
-   - Bonos en dólares: Bonares (AL29, AL30, AL35, AE38, AL41), Globales (GD29 a GD46), BOPREAL (S1 A-D y S4) y San Juan 2035 (SJO35).
-2. **Escenarios**: senda mensual editable de inflación (mueve el CER), TAMAR, A3500 y dólar MEP. Muestra el retorno de cada bono en pesos y en dólares.
-3. **Expectativas de mercado**: inflación, TAMAR y dólar breakeven, tipo de cambio real esperado y tasa real breakeven. Cada par se arma con bonos que vencen el mismo día o, si no hay, con el vencimiento más cercano. Debajo de cada valor se indica a qué período corresponde, contando los rezagos.
+   - Bonos en dólares: AL29, AL30, AL35, AE38, AL41, AO28, GD29 a GD46, BOPREAL (S1 A-D y S4) y San Juan 2035.
+2. **Escenarios**: senda mensual editable de inflación (CER), TAMAR, A3500 y dólar MEP. Arranca con la proyección del Resumen. Muestra el retorno a vencimiento en pesos y en dólares, y el de los bonos en USD a un horizonte.
+3. **Expectativas de mercado** (hoja *Breakeven*, extendida):
+   - Inflación breakeven, con la grilla de sensibilidad a precios del Excel.
+   - TAMAR breakeven y dólar breakeven.
+   - Tipo de cambio real esperado.
+   - Tasa real breakeven.
+   - Cada par se arma con bonos del mismo vencimiento o, si no hay, con el más cercano.
+   - Debajo de cada valor se indica a qué fechas o meses de IPC corresponde, contando los rezagos.
 
-## Fuentes
+## Fórmulas (iguales a la planilla)
 
-| Dato | Fuente | Respaldo si falla |
+| Instrumento | Pago / flujo | TIR |
 |---|---|---|
-| Precios | [data912](https://data912.com) `/live/*` (último operado o, con el mercado cerrado, cierre) | Último cierre histórico de data912; si tampoco hay, un precio fijo de ejemplo (cierre del 30/10/2026). La columna **Fuente** indica cuál se usó. |
+| LECAP / BONCAP | 100 × (1+TEM)^(DAYS360(emisión, vto)/30) | XIRR |
+| CER | 100 × CER(vto − 10 hábiles) / CER(emisión − 10 hábiles). El CER se proyecta con la inflación mensual: del 16/m al 15/m+1 crece al IPC de m−1 | XIRR (nominal). También se muestra la TIR real (CER t−10 constante) |
+| TAMAR | 100 × (1+TEM)^(DAYS360/30), con TEM = ((1 + (prom. TAMAR[emisión−10, vto−10] + margen)·32/365)^(365/32))^(1/12) − 1 | XIRR |
+| Dólar linked | 100 × A3500(vto − 3 hábiles) | XIRR. También se muestra la TIR en USD |
+| Bonos en USD | Intereses = VR × cupón × YEARFRAC(base 0). Paridad = precio / (VR + int. corridos) | XIRR. MD = Macaulay |
+
+- **Inflación breakeven** (hoja Breakeven):
+  - CER final = CER base × P_CER / 100 × (pago tasa fija / P_tasa fija).
+  - Inflación mensual = (1 + acumulada)^((365/12)/días) − 1.
+  - Los días se cuentan entre CER(liq − 10) y CER(vto − 10).
+
+## Verificación
+
+`python -m pytest -q` (35 tests):
+
+- `tests/test_excel.py`: reproduce los valores de la planilla al 30/10/2026:
+  - T31Y7, TZXY7, AL35D, AO28D, BPC7D y SJO35, más el breakeven T31Y7/TZXY7, todos exactos.
+  - TML27: diferencia menor a 5 pb (ver nota).
+- `tests/test_calibracion.py`: compara contra 1816 (BYMA 30/10/2026):
+  - Tasa fija y dólar linked: exactos. TAMAR: menos de 1 pb.
+  - CER: alrededor de 2 pb con datos de respaldo (falta el IPC de septiembre); exactos con el BCRA en vivo.
+  - Bonos en USD: hasta 3 pb, porque 1816 descuenta en la fecha de pago hábil y la planilla en la teórica.
+
+**Nota sobre feriados:** la hoja *Feriados* de la planilla no tiene 2027, y la fórmula de TAMAR usa solo sus primeras 17 filas. La app usa el calendario real (`calendario.py`). Con las listas de la planilla, los tests reproducen el Excel al centavo.
+
+**Márgenes TAMAR:**
+- TML27: 5,4%, como en la planilla.
+- TMF27: 6,5%, calibrado para replicar el pago proyectado de 1816 con la misma fórmula. Con ese margen, la TAMAR que 1816 proyecta es 24,22%, consistente con su dato de referencia.
+
+## Fuentes de datos
+
+| Dato | Fuente | Respaldo |
+|---|---|---|
+| Precios | data912 `/live/*` (último operado; con el mercado cerrado, cierre) | Último cierre histórico de data912 y, si no hay, un precio fijo de ejemplo. La columna **Fuente** indica cuál se usó |
 | Dólar MEP | data912 `/live/mep` (AL30) | AL30 / AL30D |
-| CER, A3500, TAMAR, inflación, REM | API de Estadísticas Monetarias del BCRA (v4.0, con v3.0 como alternativa) | Valores implícitos en los precios de 1816 del 30/10/2026 |
+| CER, A3500, TAMAR, IPC, REM | API de Estadísticas Monetarias del BCRA (v4.0 / v3.0) | Series de la planilla (`data/respaldo.json`) |
 
-El botón **🔄 Actualizar** limpia el cache y vuelve a consultar las APIs. Los precios se cachean 5 minutos y el BCRA 6 horas.
-
-## Convenciones (las mismas que 1816)
-
-- TIR = TEA con descuento `(1+TIR)^(días/365)`. TEM = `(1+TIR)^(1/12) − 1`.
-- TNA: tasa fija por plazo remanente; CER, dólar linked y USD en 180/360; TAMAR en 32/365.
-- CER: el bono cobra el CER de 10 hábiles antes del vencimiento. Para la TIR real se supone CER constante desde t−10 de la liquidación.
-- TAMAR: capitaliza la TAMAR de bancos privados de 10 hábiles antes, más el margen, convertida con la convención 32/365.
-- Dólar linked: paga 100 × A3500 de 3 hábiles antes del vencimiento.
-- Liquidación T+1 por defecto, con calendario de feriados en `calendario.py`.
-
-## Calibración
-
-`tests/test_calibracion.py` compara el motor contra los indicadores de 1816 del 30/10/2026:
-
-- Bonos en pesos: TIR y TNA idénticas. En los TAMAR la diferencia es menor a 0,5 pb.
-- Bonos en dólares: paridad idéntica; TIR con diferencias de 0 a 0,4 pb.
-
-Supuestos a revisar:
-
-- **TMF27**: el margen (4,57%) se calibró para replicar la TIR de 1816. El de TML27 (3,63%) sale del resultado de la licitación.
-- **SJO35**: las condiciones (cupón 9,55% semestral, 3 amortizaciones anuales 2033-2035) se infirieron del cupón corrido, el current yield y la duration de 1816. Coinciden en TIR y paridad.
-- **BPO28**: sin precio de referencia; el precio de ejemplo es ilustrativo.
+El botón **🔄 Actualizar** limpia el cache y vuelve a consultar.
 
 ## Correr localmente
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
-python -m pytest -q
 ```

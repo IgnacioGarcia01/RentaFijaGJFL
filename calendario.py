@@ -18,6 +18,8 @@ FERIADOS: set[date] = {
     date(2026, 5, 25), date(2026, 6, 15), date(2026, 7, 9), date(2026, 7, 10),
     date(2026, 8, 17), date(2026, 10, 12), date(2026, 11, 23), date(2026, 12, 7),
     date(2026, 12, 8), date(2026, 12, 25),
+    # Días no hábiles bancarios que figuran en la hoja Feriados del Excel
+    date(2026, 11, 6), date(2026, 11, 9), date(2026, 11, 10), date(2026, 12, 31),
     # 2027
     date(2027, 1, 1), date(2027, 2, 8), date(2027, 2, 9), date(2027, 3, 24),
     date(2027, 3, 25), date(2027, 3, 26), date(2027, 4, 2), date(2027, 5, 1),

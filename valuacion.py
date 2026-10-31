@@ -1,28 +1,33 @@
-"""Valuación de bonos en pesos, escenarios y breakevens.
+"""Valuación de bonos en pesos, escenarios y breakevens (fórmulas del Excel).
 
-`Mercado` reúne las series que hacen falta (CER, TAMAR, A3500) ya
-"completadas" con valores de respaldo si el BCRA no respondió.
+`Mercado` reúne las series históricas (CER, TAMAR, A3500). Si el BCRA no
+responde se usan las series de respaldo tomadas del Excel (data/respaldo.json).
+`Supuestos` guarda las proyecciones: inflación mensual (mueve el CER), TAMAR,
+A3500 y dólar MEP.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 
-from bonos import BONOS_PESOS, CER_REF_FALLBACK, FECHA_REF, TAMAR_REF, BonoPesos
+from bonos import BONOS_PESOS, TAMAR_REF, BonoPesos
 from calc import (
-    factor_tamar, meses_ipc_entre, proyectar_cer, serie_diaria, tea_desde_pago,
-    tem_desde_tea, tna_180_360, tna_32_365, tna_plazo_rem, valor_en,
+    anualizar, days360, mensualizar, meses_ipc_entre, proyectar_cer, serie_diaria,
+    tem_desde_tea, tem_desde_tna_tamar, tna_180_360, tna_32_365, tna_plazo_rem, valor_en,
 )
-from calendario import sumar_habiles
+from calendario import es_habil, sumar_habiles
 
 REZAGO_CER = 10      # hábiles
 REZAGO_TAMAR = 10    # hábiles
 REZAGO_A3500 = 3     # hábiles
 
 MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+RESPALDO = Path(__file__).parent / "data" / "respaldo.json"
 
 
 def nombre_mes(ym: tuple[int, int]) -> str:
@@ -33,12 +38,30 @@ def fmt_fecha(d: date) -> str:
     return d.strftime("%d/%m/%Y")
 
 
+def series_respaldo() -> dict[str, pd.Series]:
+    """CER, IPC y TAMAR del Excel (para cuando el BCRA no responde)."""
+    js = json.loads(RESPALDO.read_text())
+    out = {}
+    for k in ("cer", "tamar", "ipc"):
+        d = js.get(k, {})
+        s = pd.Series({pd.Timestamp(f): float(v) for f, v in d.items()}).sort_index()
+        out[k] = s
+    out["tamar"] = out["tamar"] / 100
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Mercado y supuestos
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class Mercado:
     liq: date
-    cer: pd.Series             # diaria, ffill
-    tamar: pd.Series           # diaria, decimal TNA
+    cer: pd.Series             # diaria (publicada)
+    tamar: pd.Series           # días hábiles, decimal TNA
     a3500: pd.Series           # diaria
+    ipc: pd.Series             # mensual, decimal
     fuentes: dict = field(default_factory=dict)
 
     @property
@@ -46,8 +69,16 @@ class Mercado:
         return self.cer.index.max().date()
 
     @property
+    def ultimo_tamar(self) -> date:
+        return self.tamar.index.max().date()
+
+    @property
     def tamar_actual(self) -> float:
         return float(self.tamar.iloc[-1])
+
+    @property
+    def tamar_prom5(self) -> float:
+        return float(self.tamar.iloc[-5:].mean())
 
     @property
     def a3500_actual(self) -> float:
@@ -56,58 +87,78 @@ class Mercado:
 
 def armar_mercado(liq: date, series: dict[str, pd.Series]) -> Mercado:
     fuentes = {}
+    resp = None
+
+    def respaldo():
+        nonlocal resp
+        if resp is None:
+            resp = series_respaldo()
+        return resp
+
+    ipc = series.get("inflacion")
+    if ipc is not None and not ipc.empty:
+        fuentes["IPC"] = "BCRA"
+    else:
+        ipc = respaldo()["ipc"]
+        fuentes["IPC"] = f"respaldo Excel (hasta {ipc.index.max():%m/%Y})"
+
     cer = series.get("cer")
     if cer is not None and not cer.empty:
         cer = serie_diaria(cer)
         fuentes["CER"] = "BCRA"
     else:
-        # Respaldo: CER normalizado (=1 a t-10 de la fecha de referencia) y
-        # constante. Las TIR reales siguen siendo correctas (son relativas).
-        d0 = sumar_habiles(FECHA_REF, -REZAGO_CER)
-        idx = pd.date_range(d0 - timedelta(days=400), max(liq, d0), freq="D")
-        cer = pd.Series(CER_REF_FALLBACK, index=idx)
-        fuentes["CER"] = "respaldo (CER normalizado, BCRA sin respuesta)"
+        cer = serie_diaria(respaldo()["cer"])
+        # Completar con el IPC conocido (el CER se publica con ~1,5 meses de rezago)
+        conocidos = {(t.year, t.month): float(v) for t, v in ipc.items()}
+        ult = cer.index.max().date()
+        hasta = ult
+        while True:
+            sig = hasta + timedelta(days=1)
+            from calc import mes_ipc_que_aplica
+            if mes_ipc_que_aplica(sig) not in conocidos:
+                break
+            hasta = sig
+        if hasta > ult:
+            cer = proyectar_cer(cer, hasta, conocidos, 0.0)
+        fuentes["CER"] = f"respaldo Excel (hasta {fmt_fecha(cer.index.max().date())})"
+
     tamar = series.get("tamar")
     if tamar is not None and not tamar.empty:
-        tamar = serie_diaria(tamar)
+        tamar = tamar.sort_index()
         fuentes["TAMAR"] = "BCRA"
     else:
-        idx = pd.date_range(FECHA_REF - timedelta(days=60), liq, freq="D")
-        tamar = pd.Series(TAMAR_REF, index=idx)
-        fuentes["TAMAR"] = f"respaldo ({TAMAR_REF:.2%}, implícita en 1816 al 30/10/2026)"
+        tamar = respaldo()["tamar"]
+        if tamar.empty:
+            tamar = pd.Series([TAMAR_REF], index=[pd.Timestamp(liq)])
+        fuentes["TAMAR"] = f"respaldo Excel (hasta {fmt_fecha(tamar.index.max().date())})"
+
     a3500 = series.get("a3500")
     if a3500 is not None and not a3500.empty:
         a3500 = serie_diaria(a3500)
         fuentes["A3500"] = "BCRA"
     else:
         ref = next(b.a3500_ref for b in BONOS_PESOS if b.a3500_ref)
-        idx = pd.date_range(FECHA_REF - timedelta(days=60), liq, freq="D")
+        idx = pd.date_range(liq - timedelta(days=60), liq, freq="D")
         a3500 = pd.Series(ref, index=idx)
         fuentes["A3500"] = f"respaldo ({ref:,.2f}, implícito en TZV27 al 30/10/2026)"
-    return Mercado(liq=liq, cer=cer, tamar=tamar, a3500=a3500, fuentes=fuentes)
-
-
-# ---------------------------------------------------------------------------
-# Supuestos de proyección
-# ---------------------------------------------------------------------------
+    return Mercado(liq=liq, cer=cer, tamar=tamar, a3500=a3500, ipc=ipc, fuentes=fuentes)
 
 
 @dataclass
 class Supuestos:
-    """Supuestos de un escenario. Si un dict está vacío se usa el default."""
-    inflacion: dict[tuple[int, int], float] = field(default_factory=dict)
-    inflacion_default: float = 0.0       # 0 = CER "plano" (convención TIR real)
-    tamar: float | None = None           # TNA proyectada (None = última)
+    """Proyecciones. Las claves de los dict son (año, mes)."""
+    inflacion: dict[tuple[int, int], float] = field(default_factory=dict)   # IPC mensual
+    inflacion_default: float = 0.02
+    tamar: float = TAMAR_REF                                                 # TNA proyectada
     tamar_mensual: dict[tuple[int, int], float] = field(default_factory=dict)
     a3500_mensual: dict[tuple[int, int], float] = field(default_factory=dict)
-    a3500_default: float = 0.0           # devaluación mensual
+    a3500_default: float = 0.0
     mep_mensual: dict[tuple[int, int], float] = field(default_factory=dict)
     mep_default: float = 0.0
-    cer_plano: bool = True               # True: CER constante desde t-10 de la liquidación
 
 
 def proyectar_mensual(valor0: float, d0: date, d1: date, tasas: dict, default: float) -> float:
-    """Valor en d1 partiendo de valor0 en d0 con tasas mensuales (capitalización diaria)."""
+    """Valor en d1 partiendo de valor0 en d0 con variaciones mensuales (capitalización diaria)."""
     v = valor0
     d = d0
     while d < d1:
@@ -118,18 +169,28 @@ def proyectar_mensual(valor0: float, d0: date, d1: date, tasas: dict, default: f
     return v
 
 
-def serie_tamar_proyectada(m: Mercado, hasta: date, sup: Supuestos) -> pd.Series:
+def cer_proyectado(m: Mercado, hasta: date, sup: Supuestos) -> pd.Series:
+    return proyectar_cer(m.cer, hasta, sup.inflacion, sup.inflacion_default)
+
+
+def tamar_proyectada(m: Mercado, hasta: date, sup: Supuestos) -> pd.Series:
+    """Serie TAMAR (hábiles) extendida con la proyección (hoja 'Serie TAMAR')."""
     s = m.tamar
-    if not sup.tamar_mensual and sup.tamar is None:
-        return s
     ult = s.index.max().date()
     vals = {}
     d = ult
     while d < hasta:
         d += timedelta(days=1)
-        vals[pd.Timestamp(d)] = sup.tamar_mensual.get((d.year, d.month),
-                                                      sup.tamar if sup.tamar is not None else float(s.iloc[-1]))
-    return pd.concat([s, pd.Series(vals)]) if vals else s
+        if es_habil(d):
+            vals[pd.Timestamp(d)] = sup.tamar_mensual.get((d.year, d.month), sup.tamar)
+    return pd.concat([s, pd.Series(vals, dtype=float)]) if vals else s
+
+
+def a3500_en(m: Mercado, d: date, sup: Supuestos) -> float:
+    d0 = m.a3500.index.max().date()
+    if d <= d0:
+        return valor_en(m.a3500, d)
+    return proyectar_mensual(m.a3500_actual, d0, d, sup.a3500_mensual, sup.a3500_default)
 
 
 # ---------------------------------------------------------------------------
@@ -137,71 +198,67 @@ def serie_tamar_proyectada(m: Mercado, hasta: date, sup: Supuestos) -> pd.Series
 # ---------------------------------------------------------------------------
 
 
-def cer_base(b: BonoPesos, m: Mercado) -> float:
-    """CER base del bono: CER[t-10 de FECHA_REF] / (VT_ref / 100)."""
-    c_ref = valor_en(m.cer, sumar_habiles(FECHA_REF, -REZAGO_CER))
-    return c_ref / (b.vt_ref / 100)
+def promedio_tamar(serie: pd.Series, desde: date, hasta: date) -> float:
+    """AVERAGEIFS de la TAMAR entre dos fechas (inclusive)."""
+    sub = serie.loc[pd.Timestamp(desde): pd.Timestamp(hasta)]
+    return float(sub.mean())
 
 
-def valor_tecnico(b: BonoPesos, m: Mercado) -> float | None:
+def pago_tamar(b: BonoPesos, serie: pd.Series) -> tuple[float, float, float]:
+    """Pago final, TAMAR promedio y TEM (hoja TML27 del Excel)."""
+    prom = promedio_tamar(serie, sumar_habiles(b.emision, -REZAGO_TAMAR), sumar_habiles(b.vencimiento, -REZAGO_TAMAR))
+    tem = tem_desde_tna_tamar(prom + b.margen)
+    return 100 * (1 + tem) ** (days360(b.emision, b.vencimiento) / 30), prom, tem
+
+
+def valor_tecnico(b: BonoPesos, m: Mercado, sup: Supuestos | None = None) -> float | None:
     if b.tipo == "CER":
-        c = valor_en(m.cer, sumar_habiles(m.liq, -REZAGO_CER))
-        return 100 * c / cer_base(b, m)
+        # Si el CER de t-10 todavía no se publicó se toma el proyectado (como la hoja CER).
+        f = sumar_habiles(m.liq, -REZAGO_CER)
+        return 100 * valor_en(cer_proyectado(m, f, sup or Supuestos()), f) / b.cer_base
     if b.tipo == "TAMAR":
-        if m.liq >= FECHA_REF:
-            return b.vt_ref * factor_tamar(m.tamar, FECHA_REF, m.liq, b.margen, m.tamar_actual, REZAGO_TAMAR)
-        return b.vt_ref / factor_tamar(m.tamar, m.liq, FECHA_REF, b.margen, m.tamar_actual, REZAGO_TAMAR)
+        hasta = min(sumar_habiles(m.liq, -REZAGO_TAMAR), m.ultimo_tamar)
+        prom = promedio_tamar(m.tamar, sumar_habiles(b.emision, -REZAGO_TAMAR), hasta)
+        return 100 * (1 + tem_desde_tna_tamar(prom + b.margen)) ** (days360(b.emision, m.liq) / 30)
     if b.tipo == "Dólar linked":
-        # 100 USD de VN valuados al último A3500 (en pesos, como cotiza el bono)
         return 100.0 * m.a3500_actual
     return None
 
 
-def pago_final(b: BonoPesos, m: Mercado, sup: Supuestos | None = None) -> float:
-    """Pago al vencimiento (por 100 VN) bajo los supuestos dados.
-
-    Sin supuestos -> convención de mercado (la de 1816): CER constante desde
-    t-10 de la liquidación, TAMAR constante en el último dato y A3500 constante.
-    """
-    sup = sup or Supuestos()
+def pago_final(b: BonoPesos, m: Mercado, sup: Supuestos) -> float:
     if b.tipo == "Tasa fija":
         return b.pago_final
     if b.tipo == "CER":
-        f_cer = sumar_habiles(b.vencimiento, -REZAGO_CER)
-        if sup.cer_plano:
-            c = valor_en(m.cer, sumar_habiles(m.liq, -REZAGO_CER))
-        else:
-            serie = proyectar_cer(m.cer, f_cer, sup.inflacion, sup.inflacion_default)
-            c = valor_en(serie, f_cer)
-        return 100 * c / cer_base(b, m)
+        f = sumar_habiles(b.vencimiento, -REZAGO_CER)
+        return 100 * valor_en(cer_proyectado(m, f, sup), f) / b.cer_base
     if b.tipo == "TAMAR":
-        vt = valor_tecnico(b, m)
-        tam = serie_tamar_proyectada(m, b.vencimiento, sup)
-        proy = sup.tamar if sup.tamar is not None else m.tamar_actual
-        return vt * factor_tamar(tam, m.liq, b.vencimiento, b.margen, proy, REZAGO_TAMAR)
+        return pago_tamar(b, tamar_proyectada(m, b.vencimiento, sup))[0]
     if b.tipo == "Dólar linked":
-        f_a = sumar_habiles(b.vencimiento, -REZAGO_A3500)
-        a0 = m.a3500_actual
-        d0 = m.a3500.index.max().date()
-        a = proyectar_mensual(a0, d0, f_a, sup.a3500_mensual, sup.a3500_default) if f_a > d0 else valor_en(m.a3500, f_a)
-        return 100 * a
+        return 100 * a3500_en(m, sumar_habiles(b.vencimiento, -REZAGO_A3500), sup)
     raise ValueError(b.tipo)
 
 
-def indicadores_pesos(b: BonoPesos, precio: float, m: Mercado, sup: Supuestos | None = None) -> dict:
+def tir_real_o_usd(b: BonoPesos, precio: float, m: Mercado, sup: Supuestos | None = None) -> float | None:
+    """CER: TIR real (CER t-10 constante). DL: TIR en USD (A3500 constante)."""
+    dias = (b.vencimiento - m.liq).days
+    if b.tipo == "CER":
+        return (valor_tecnico(b, m, sup) / precio) ** (365 / dias) - 1
+    if b.tipo == "Dólar linked":
+        return (100 * m.a3500_actual / precio) ** (365 / dias) - 1
+    return None
+
+
+def indicadores_pesos(b: BonoPesos, precio: float, m: Mercado, sup: Supuestos) -> dict:
     dias = (b.vencimiento - m.liq).days
     pago = pago_final(b, m, sup)
-    tea = tea_desde_pago(precio, pago, dias)
+    tir = (pago / precio) ** (365 / dias) - 1          # = XIRR con un único flujo
     if b.tipo == "Tasa fija":
         tna, conv = tna_plazo_rem(precio, pago, dias), "plazo rem."
-        tem = tem_desde_tea(tea)
     elif b.tipo == "TAMAR":
-        tna, conv = tna_32_365(tea), "32/365"
-        tem = tem_desde_tea(tea)
+        tna, conv = tna_32_365(tir), "32/365"
     else:
-        tna, conv = tna_180_360(tea), "180/360"
-        tem = tem_desde_tea(tea)
-    vt = valor_tecnico(b, m)
+        tna, conv = tna_180_360(tir), "180/360"
+    vt = valor_tecnico(b, m, sup)
     return {
         "Ticker": b.ticker,
         "Tipo": b.tipo,
@@ -211,21 +268,22 @@ def indicadores_pesos(b: BonoPesos, precio: float, m: Mercado, sup: Supuestos | 
         "VT": vt,
         "Paridad": precio / vt if vt else None,
         "Pago final": pago,
+        "Retorno directo": pago / precio - 1,
         "TNA": tna,
         "Conv. TNA": conv,
-        "TEM": tem,
-        "TIR (TEA)": tea,
-        "Duration": dias / 365,
-        "Dur. mod.": dias / 365 / (1 + tea),
+        "TEM": tem_desde_tea(tir),
+        "TIR (TEA)": tir,
+        "TIR real / USD": tir_real_o_usd(b, precio, m, sup),
+        "MD": dias / 365,
     }
 
 
 # ---------------------------------------------------------------------------
-# Breakevens
+# Breakevens (hoja Breakeven del Excel, extendida al resto de los pares)
 # ---------------------------------------------------------------------------
 
 
-def _biseccion(f, lo, hi, it=120):
+def _biseccion(f, lo, hi, it=150):
     flo = f(lo)
     for _ in range(it):
         mid = (lo + hi) / 2
@@ -241,123 +299,125 @@ def par_mas_cercano(b: BonoPesos, candidatos: list[BonoPesos]) -> BonoPesos:
     return min(candidatos, key=lambda c: abs((c.vencimiento - b.vencimiento).days))
 
 
-def retorno_objetivo(ref: BonoPesos, p_ref: float, obj: BonoPesos, m: Mercado,
-                     sup: Supuestos | None = None) -> tuple[float, float]:
-    """Factor que debe rendir `obj` para igualar a `ref` (misma TEA al plazo de obj)."""
-    dias_ref = (ref.vencimiento - m.liq).days
-    tea_ref = tea_desde_pago(p_ref, pago_final(ref, m, sup), dias_ref)
-    dias_obj = (obj.vencimiento - m.liq).days
-    return (1 + tea_ref) ** (dias_obj / 365), tea_ref
+def factor_objetivo(ref: BonoPesos, p_ref: float, obj: BonoPesos, m: Mercado, sup: Supuestos) -> float:
+    """Retorno total que debe dar `obj` para igualar a `ref`.
+
+    Mismo vencimiento: el retorno directo de `ref` (Excel: C6/C5). Si no, la TEA
+    de `ref` llevada al plazo de `obj` (breakeven aproximado).
+    """
+    pago = pago_final(ref, m, sup)
+    if ref.vencimiento == obj.vencimiento:
+        return pago / p_ref
+    tea = (pago / p_ref) ** (365 / (ref.vencimiento - m.liq).days) - 1
+    return (1 + tea) ** ((obj.vencimiento - m.liq).days / 365)
 
 
-def be_inflacion(fija: BonoPesos, p_fija: float, cer: BonoPesos, p_cer: float, m: Mercado) -> dict:
-    factor, tea_fija = retorno_objetivo(fija, p_fija, cer, m)
-    pago_obj = p_cer * factor
-    f_cer = sumar_habiles(cer.vencimiento, -REZAGO_CER)
-    base = cer_base(cer, m)
-
-    def err(pi):
-        s = proyectar_cer(m.cer, f_cer, {}, pi)
-        return 100 * valor_en(s, f_cer) / base - pago_obj
-
-    pi = _biseccion(err, -0.05, 0.30)
-    c0 = valor_en(m.cer, sumar_habiles(m.liq, -REZAGO_CER))
-    c_t = pago_obj * base / 100
-    meses_desc = meses_ipc_entre(m.ultimo_cer, f_cer)
-    meses_tot = meses_ipc_entre(sumar_habiles(m.liq, -REZAGO_CER), f_cer)
-    acumulada = c_t / c0 - 1
+def be_inflacion(fija: BonoPesos, p_fija: float, cer: BonoPesos, p_cer: float, m: Mercado,
+                 sup: Supuestos, shock_fija: float = 0.0, shock_cer: float = 0.0) -> dict:
+    p_f, p_c = p_fija * (1 + shock_fija), p_cer * (1 + shock_cer)
+    f0 = sumar_habiles(m.liq, -REZAGO_CER)
+    f1 = sumar_habiles(cer.vencimiento, -REZAGO_CER)
+    dias = (f1 - f0).days
+    cer_ini = valor_en(cer_proyectado(m, f0, sup), f0)
+    cer_be = cer.cer_base * p_c / 100 * factor_objetivo(fija, p_f, cer, m, sup)
+    acum = cer_be / cer_ini - 1
+    cer_proy = valor_en(cer_proyectado(m, f1, sup), f1)
+    proy_acum = cer_proy / cer_ini - 1
     return {
-        "valor": pi,
-        "anual": (1 + pi) ** 12 - 1,
-        "acumulada": acumulada,
-        "tea_fija": tea_fija,
-        "meses_desconocidos": meses_desc,
-        "meses_totales": meses_tot,
-        "fecha_cer": f_cer,
+        "valor": mensualizar(acum, dias),
+        "anual": anualizar(acum, dias),
+        "acumulada": acum,
+        "cer_be": cer_be,
+        "cer_ini": cer_ini,
+        "proyectada": mensualizar(proy_acum, dias),
+        "fecha_ini": f0,
+        "fecha_fin": f1,
+        "dias": dias,
+        "mismo_vto": fija.vencimiento == cer.vencimiento,
+        "meses": meses_ipc_entre(f0, f1),
+        "meses_desconocidos": meses_ipc_entre(max(f0, m.ultimo_cer), f1),
         "ultimo_cer": m.ultimo_cer,
     }
 
 
-def be_tamar(fija: BonoPesos, p_fija: float, tam: BonoPesos, p_tam: float, m: Mercado) -> dict:
-    factor, tea_fija = retorno_objetivo(fija, p_fija, tam, m)
-    pago_obj = p_tam * factor
-    vt = valor_tecnico(tam, m)
+def be_tamar(fija: BonoPesos, p_fija: float, tam: BonoPesos, p_tam: float, m: Mercado, sup: Supuestos) -> dict:
+    pago_obj = p_tam * factor_objetivo(fija, p_fija, tam, m, sup)
 
     def err(t):
-        return vt * factor_tamar(m.tamar, m.liq, tam.vencimiento, tam.margen, t, REZAGO_TAMAR) - pago_obj
+        s = Supuestos(**{**sup.__dict__, "tamar": t, "tamar_mensual": {}})
+        return pago_tamar(tam, tamar_proyectada(m, tam.vencimiento, s))[0] - pago_obj
 
     t = _biseccion(err, -0.2, 2.0)
-    ultimo = m.tamar.index.max().date()
     return {
         "valor": t,
-        "tea": (1 + t * 32 / 365) ** (365 / 32) - 1,
-        "tea_fija": tea_fija,
-        "desde": max(sumar_habiles(m.liq, -REZAGO_TAMAR), ultimo + timedelta(days=1)),
-        "hasta": sumar_habiles(tam.vencimiento - timedelta(days=1), -REZAGO_TAMAR),
-        "ultimo_dato": ultimo,
+        "desde": m.ultimo_tamar + timedelta(days=1),
+        "hasta": sumar_habiles(tam.vencimiento, -REZAGO_TAMAR),
+        "ultimo_dato": m.ultimo_tamar,
+        "inicio_promedio": sumar_habiles(tam.emision, -REZAGO_TAMAR),
     }
 
 
-def be_dolar(fija: BonoPesos, p_fija: float, dl: BonoPesos, p_dl: float, m: Mercado) -> dict:
-    factor, tea_fija = retorno_objetivo(fija, p_fija, dl, m)
-    a_t = p_dl * factor / 100
-    a0 = m.a3500_actual
+def be_dolar(fija: BonoPesos, p_fija: float, dl: BonoPesos, p_dl: float, m: Mercado, sup: Supuestos) -> dict:
+    a_t = p_dl * factor_objetivo(fija, p_fija, dl, m, sup) / 100
     f_a = sumar_habiles(dl.vencimiento, -REZAGO_A3500)
-    dias = (f_a - m.a3500.index.max().date()).days
-    var = a_t / a0 - 1
+    d0 = m.a3500.index.max().date()
+    dias = (f_a - d0).days
+    var = a_t / m.a3500_actual - 1
     return {
-        "valor": a_t,
-        "a3500_hoy": a0,
-        "variacion": var,
-        "mensual": (1 + var) ** (30 / dias) - 1 if dias > 0 else float("nan"),
-        "anual": (1 + var) ** (365 / dias) - 1 if dias > 0 else float("nan"),
-        "fecha": f_a,
-        "tea_fija": tea_fija,
+        "valor": a_t, "a3500_hoy": m.a3500_actual, "fecha_a3500_hoy": d0, "variacion": var,
+        "mensual": mensualizar(var, dias), "anual": anualizar(var, dias), "fecha": f_a,
     }
 
 
-def tcr_esperado(cer: BonoPesos, p_cer: float, dl: BonoPesos, p_dl: float, m: Mercado) -> dict:
+def tcr_esperado(cer: BonoPesos, p_cer: float, dl: BonoPesos, p_dl: float, m: Mercado,
+                 sup: Supuestos | None = None) -> dict:
     """Variación real del A3500 (deflactado por CER) que iguala CER y dólar linked.
 
-    Rinde igual si A_T/A_0 / (C_T/C_0) = [(pago_CER/P_CER) / (C_T/C_0)] / [(pago_DL/P_DL) / (A_T/A_0)]^-1
-    -> la depreciación real implícita es el cociente de los rendimientos "reales"
-    de cada bono medidos contra su propio índice.
+    Rinden igual si (A_T/A_0) / (C_T/C_0) = (1 + r_CER)^t / (1 + r_DL)^t, con
+    r_CER = tasa real del CER y r_DL = tasa en USD del dólar linked.
     """
-    dias_cer = (cer.vencimiento - m.liq).days
-    dias_dl = (dl.vencimiento - m.liq).days
-    # rendimiento sobre el índice (índice constante): VT/P para CER, 100*A0/P para DL
-    r_cer = (pago_final(cer, m) / p_cer) ** (365 / dias_cer) - 1
-    r_dl = (100 * m.a3500_actual / p_dl) ** (365 / dias_dl) - 1
+    r_cer = tir_real_o_usd(cer, p_cer, m, sup)
+    r_dl = tir_real_o_usd(dl, p_dl, m)
     anual = (1 + r_cer) / (1 + r_dl) - 1
+    dias = (dl.vencimiento - m.liq).days
     return {
-        "anual": anual,
-        "acumulada": (1 + anual) ** (dias_dl / 365) - 1,
-        "r_cer": r_cer,
-        "r_dl": r_dl,
+        "anual": anual, "acumulada": (1 + anual) ** (dias / 365) - 1, "r_cer": r_cer, "r_dl": r_dl,
         "fecha_a3500": sumar_habiles(dl.vencimiento, -REZAGO_A3500),
         "fecha_cer": sumar_habiles(cer.vencimiento, -REZAGO_CER),
     }
 
 
-def tasa_real_be(tam: BonoPesos, p_tam: float, cer: BonoPesos, p_cer: float, m: Mercado) -> dict:
-    """Tasa real (TAMAR + margen, deflactada por CER) que iguala TAMAR y CER.
+def tasa_real_be(tam: BonoPesos, p_tam: float, cer: BonoPesos, p_cer: float, m: Mercado, sup: Supuestos) -> dict:
+    """TAMAR real que iguala TAMAR y CER.
 
-    Rinde igual si  (1+TEA_{TAMAR+m}) * k = (1+r_CER)(1+pi)  con k=(VT/P)^(1/t).
-    => (1+TEA_{TAMAR+m})/(1+pi) = (1+r_CER)/k : no depende de la inflación.
+    Para cada inflación, la TAMAR que iguala ambos bonos es T(pi); la tasa
+    real implícita es (1 + TEA(T))/(1 + pi) - 1. Se resuelve con la inflación
+    del escenario (y es casi insensible a ella).
     """
-    dias_cer = (cer.vencimiento - m.liq).days
     dias_tam = (tam.vencimiento - m.liq).days
-    r_cer = (pago_final(cer, m) / p_cer) ** (365 / dias_cer) - 1
-    vt = valor_tecnico(tam, m)
-    k = (vt / p_tam) ** (365 / dias_tam)
-    real_con_margen = (1 + r_cer) / k - 1
-    tea_margen = (1 + tam.margen * 32 / 365) ** (365 / 32) - 1
-    real_sin_margen = (1 + real_con_margen) / (1 + tea_margen) - 1
+    dias_cer = (cer.vencimiento - m.liq).days
+    f1 = sumar_habiles(cer.vencimiento, -REZAGO_CER)
+    f0 = sumar_habiles(m.liq, -REZAGO_CER)
+    r_cer = tir_real_o_usd(cer, p_cer, m, sup)
+    infl_cer = valor_en(cer_proyectado(m, f1, sup), f1) / valor_en(cer_proyectado(m, f0, sup), f0)
+    infl_anual = infl_cer ** (365 / (f1 - f0).days) - 1
+    # Retorno nominal del CER con la inflación del escenario, anualizado y llevado al plazo del TAMAR
+    tea_cer_nom = (1 + r_cer) * (1 + infl_anual) - 1
+    pago_obj = p_tam * (1 + tea_cer_nom) ** (dias_tam / 365)
+
+    def err(t):
+        s = Supuestos(**{**sup.__dict__, "tamar": t, "tamar_mensual": {}})
+        return pago_tamar(tam, tamar_proyectada(m, tam.vencimiento, s))[0] - pago_obj
+
+    t = _biseccion(err, -0.2, 2.0)
+    tea_t = (1 + t * 32 / 365) ** (365 / 32) - 1
+    tea_tm = (1 + (t + tam.margen) * 32 / 365) ** (365 / 32) - 1
     return {
-        "con_margen": real_con_margen,
-        "sin_margen": real_sin_margen,
-        "r_cer": r_cer,
-        "margen": tam.margen,
-        "hasta_tamar": sumar_habiles(tam.vencimiento - timedelta(days=1), -REZAGO_TAMAR),
-        "hasta_cer": sumar_habiles(cer.vencimiento, -REZAGO_CER),
+        "sin_margen": (1 + tea_t) / (1 + infl_anual) - 1,
+        "con_margen": (1 + tea_tm) / (1 + infl_anual) - 1,
+        "tamar_be": t, "inflacion_supuesta": infl_anual, "r_cer": r_cer, "margen": tam.margen,
+        "hasta_tamar": sumar_habiles(tam.vencimiento, -REZAGO_TAMAR),
+        "hasta_cer": f1,
+        "mismo_vto": tam.vencimiento == cer.vencimiento,
+        "dias_cer": dias_cer,
     }
